@@ -19,9 +19,12 @@
 #include <dwrite.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -37,6 +40,8 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 
+static constexpr wchar_t kAppTitle[] = L"RamClip v2.4";
+
 template<class T>
 static void SafeRelease(T*& p) {
     if (p) {
@@ -46,7 +51,7 @@ static void SafeRelease(T*& p) {
 }
 
 // CF_HDROP 开头的数据结构。
-// 不直接使用 DROPFILES，因为部分 LLVM-MinGW 头文件组合没有暴露该 typedef。
+// 不依赖某些 LLVM-MinGW 头文件组合中缺失的系统文件投递头 typedef。
 struct DropFilesHeader {
     DWORD pFiles;
     POINT pt;
@@ -58,6 +63,11 @@ static_assert(
     sizeof(DropFilesHeader) == 20,
     "Unexpected CF_HDROP header size"
 );
+static_assert(offsetof(DropFilesHeader, pFiles) == 0);
+static_assert(offsetof(DropFilesHeader, pt) == 4);
+static_assert(offsetof(DropFilesHeader, fNC) == 12);
+static_assert(offsetof(DropFilesHeader, fWide) == 16);
+static_assert(sizeof(wchar_t) == 2, "RamClip expects the Windows UTF-16 ABI");
 
 
 struct ClipFormatData {
@@ -101,7 +111,6 @@ struct ClipboardBackup {
 
 enum class PastePhase {
     None,
-    WaitModifiers,
     RestoreClipboard
 };
 
@@ -180,12 +189,10 @@ static constexpr UINT WM_APP_OUTSIDE_CLICK = WM_APP + 1;
 static std::wstring g_status;
 
 static PastePhase g_pastePhase = PastePhase::None;
-static int g_pasteWaitTicks = 0;
 static int g_pasteRestoreTicks = 0;
-static ClipSlot g_pendingPasteSlot;
+static int g_pasteRestoreDelayTicks = 25;
+static DWORD g_pasteTempSequence = 0;
 static ClipboardBackup g_pasteBackup;
-static bool g_pendingPasteDeleteAfter = false;
-static int g_pendingPasteDeleteIndex = -1;
 
 static CaptureSelectionPhase g_captureSelectionPhase = CaptureSelectionPhase::None;
 static int g_captureSelectionTicks = 0;
@@ -220,14 +227,14 @@ static const wchar_t* kInstructions =
     L"剪贴板槽位位于右上角\n"
     L"点击可切换槽位\n"
     L"Alt+C：将当前选中内容添加为槽位 1\n"
-    L"Alt+V：粘贴槽位 1\n"
+    L"Alt+V：全局粘贴槽位 1（可连续触发）\n"
     L"Alt+Z：删除槽位 1\n"
     L"Alt+1：切换槽位\n"
     L"Alt+2：将当前剪贴板内容添加为槽位 1\n"
     L"Alt+3：复制当前槽位到系统剪贴板\n"
     L"Alt+4：删除当前槽位\n"
-    L"Alt+5：粘贴当前槽位\n"
-    L"Ctrl+Alt+1：粘贴当前槽位并删除\n"
+    L"Alt+5：全局粘贴当前槽位（可连续触发）\n"
+    L"Ctrl+Alt+1：全局粘贴当前槽位并删除（可连续触发）\n"
     L"Ctrl+Alt+`：退出程序";
 
 static bool OpenClipboardRetry(HWND owner) {
@@ -247,11 +254,23 @@ static const ClipFormatData* FindFormat(const ClipSlot& slot, UINT fmt) {
 
 static std::wstring BytesToWideText(const std::vector<std::uint8_t>& b) {
     if (b.size() < sizeof(wchar_t)) return {};
-    const wchar_t* p = reinterpret_cast<const wchar_t*>(b.data());
-    size_t count = b.size() / sizeof(wchar_t);
-    size_t n = 0;
-    while (n < count && p[n] != L'\0') ++n;
-    return std::wstring(p, p + n);
+
+    const size_t count = b.size() / sizeof(wchar_t);
+    std::wstring out;
+    out.reserve(std::min<size_t>(count, 4096));
+
+    for (size_t i = 0; i < count; ++i) {
+        wchar_t ch = L'\0';
+        std::memcpy(
+            &ch,
+            b.data() + i * sizeof(wchar_t),
+            sizeof(wchar_t)
+        );
+        if (ch == L'\0') break;
+        out.push_back(ch);
+    }
+
+    return out;
 }
 
 static std::wstring AnsiToWide(const char* s, size_t len) {
@@ -271,93 +290,84 @@ static std::wstring FileListPreview(
         *outCount = 0;
     }
 
-    // 不使用 DROPFILES，直接解析 CF_HDROP 的二进制头。
+    // Some LLVM-MinGW header combinations do not expose the system file-drop header typedef.
+    // Copy the compatible 20-byte header instead of aliasing byte storage.
     if (b.size() < sizeof(DropFilesHeader)) {
         return {};
     }
 
-    const auto* df =
-        reinterpret_cast<const DropFilesHeader*>(b.data());
+    DropFilesHeader df{};
+    std::memcpy(&df, b.data(), sizeof(df));
 
-    if (df->pFiles >= b.size()) {
+    if (df.pFiles < sizeof(DropFilesHeader) ||
+        static_cast<size_t>(df.pFiles) >= b.size()) {
         return {};
     }
 
+    const size_t payloadOffset = static_cast<size_t>(df.pFiles);
     std::wstring out;
     int count = 0;
     constexpr int maxShown = 8;
 
-    if (df->fWide) {
-        // Unicode 文件路径列表。
-        const wchar_t* p =
-            reinterpret_cast<const wchar_t*>(
-                b.data() + df->pFiles
-            );
-
-        const size_t remain =
-            (b.size() - df->pFiles) / sizeof(wchar_t);
+    if (df.fWide) {
+        const size_t payloadBytes = b.size() - payloadOffset;
+        const size_t codeUnits = payloadBytes / sizeof(wchar_t);
 
         size_t pos = 0;
+        while (pos < codeUnits) {
+            std::wstring path;
 
-        while (pos < remain && p[pos] != L'\0') {
-            const size_t start = pos;
+            for (; pos < codeUnits; ++pos) {
+                wchar_t ch = L'\0';
+                std::memcpy(
+                    &ch,
+                    b.data() + payloadOffset +
+                        pos * sizeof(wchar_t),
+                    sizeof(wchar_t)
+                );
 
-            while (pos < remain && p[pos] != L'\0') {
-                ++pos;
-            }
-
-            std::wstring path(
-                p + start,
-                p + pos
-            );
-
-            ++count;
-
-            if (count <= maxShown) {
-                if (!out.empty()) {
-                    out += L"\n";
+                if (ch == L'\0') {
+                    ++pos;
+                    break;
                 }
 
-                out += path;
+                path.push_back(ch);
             }
 
-            // 跳过当前字符串结尾的 NUL。
-            ++pos;
+            if (path.empty()) {
+                break;
+            }
+
+            ++count;
+            if (count <= maxShown) {
+                if (!out.empty()) out += L"\n";
+                out += path;
+            }
         }
-    }
-    else {
-        // ANSI 文件路径列表。
-        const char* p =
-            reinterpret_cast<const char*>(
-                b.data() + df->pFiles
-            );
-
-        const size_t remain =
-            b.size() - df->pFiles;
-
+    } else {
+        const char* p = reinterpret_cast<const char*>(
+            b.data() + payloadOffset
+        );
+        const size_t remain = b.size() - payloadOffset;
         size_t pos = 0;
 
-        while (pos < remain && p[pos] != '\0') {
+        while (pos < remain) {
             const size_t start = pos;
-
             while (pos < remain && p[pos] != '\0') {
                 ++pos;
             }
 
-            ++count;
-
-            if (count <= maxShown) {
-                if (!out.empty()) {
-                    out += L"\n";
-                }
-
-                out += AnsiToWide(
-                    p + start,
-                    pos - start
-                );
+            if (pos == start) {
+                break;
             }
 
-            ++pos;
+            ++count;
+            if (count <= maxShown) {
+                if (!out.empty()) out += L"\n";
+                out += AnsiToWide(p + start, pos - start);
+            }
+
+            if (pos < remain) ++pos;
         }
     }
 
@@ -372,48 +382,219 @@ static std::wstring FileListPreview(
     return out;
 }
 
-static size_t DIBBitsOffset(const std::vector<std::uint8_t>& b) {
-    if (b.size() < sizeof(BITMAPINFOHEADER)) return 0;
-    const BITMAPINFOHEADER* h = reinterpret_cast<const BITMAPINFOHEADER*>(b.data());
-    if (h->biSize < sizeof(BITMAPINFOHEADER) || h->biSize > b.size()) return 0;
+static bool CheckedAddSize(
+    size_t a,
+    size_t b,
+    size_t& out
+) {
+    if (a > std::numeric_limits<size_t>::max() - b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
 
-    size_t offset = h->biSize;
-    if (h->biSize == sizeof(BITMAPINFOHEADER)) {
-        if (h->biCompression == BI_BITFIELDS) offset += 3 * sizeof(DWORD);
-        else if (h->biCompression == BI_ALPHABITFIELDS) offset += 4 * sizeof(DWORD);
+static bool CheckedMulSize(
+    size_t a,
+    size_t b,
+    size_t& out
+) {
+    if (a != 0 &&
+        b > std::numeric_limits<size_t>::max() / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+static bool ReadBitmapInfoHeader(
+    const std::vector<std::uint8_t>& b,
+    BITMAPINFOHEADER& h
+) {
+    if (b.size() < sizeof(BITMAPINFOHEADER)) {
+        return false;
     }
 
-    DWORD colors = h->biClrUsed;
-    if (colors == 0 && h->biBitCount <= 8) colors = (1u << h->biBitCount);
-    offset += static_cast<size_t>(colors) * sizeof(RGBQUAD);
+    std::memcpy(&h, b.data(), sizeof(h));
 
-    if (offset >= b.size()) return 0;
+    if (h.biSize < sizeof(BITMAPINFOHEADER) ||
+        static_cast<size_t>(h.biSize) > b.size()) {
+        return false;
+    }
+
+    return true;
+}
+
+static size_t DIBBitsOffset(
+    const std::vector<std::uint8_t>& b,
+    const BITMAPINFOHEADER& h
+) {
+    size_t offset = static_cast<size_t>(h.biSize);
+
+    if (h.biSize == sizeof(BITMAPINFOHEADER)) {
+        size_t maskBytes = 0;
+        if (h.biCompression == BI_BITFIELDS) {
+            maskBytes = 3 * sizeof(DWORD);
+        } else if (h.biCompression == BI_ALPHABITFIELDS) {
+            maskBytes = 4 * sizeof(DWORD);
+        }
+
+        if (!CheckedAddSize(offset, maskBytes, offset)) {
+            return 0;
+        }
+    }
+
+    DWORD colors = h.biClrUsed;
+    if (colors == 0 && h.biBitCount <= 8) {
+        colors = 1u << h.biBitCount;
+    }
+
+    size_t paletteBytes = 0;
+    if (!CheckedMulSize(
+            static_cast<size_t>(colors),
+            sizeof(RGBQUAD),
+            paletteBytes
+        ) ||
+        !CheckedAddSize(offset, paletteBytes, offset)) {
+        return 0;
+    }
+
+    if (offset >= b.size()) {
+        return 0;
+    }
+
     return offset;
+}
+
+static bool ValidateDIBPayload(
+    const std::vector<std::uint8_t>& b,
+    BITMAPINFOHEADER& h,
+    size_t& bitsOffset,
+    int& srcW,
+    int& srcH
+) {
+    if (!ReadBitmapInfoHeader(b, h)) {
+        return false;
+    }
+
+    if (h.biPlanes != 1 ||
+        h.biWidth <= 0 ||
+        h.biHeight == 0 ||
+        h.biHeight == INT_MIN) {
+        return false;
+    }
+
+    srcW = h.biWidth;
+    srcH = h.biHeight < 0 ? -h.biHeight : h.biHeight;
+
+    if (srcW > 32768 || srcH > 32768) {
+        return false;
+    }
+
+    switch (h.biBitCount) {
+    case 1:
+    case 4:
+    case 8:
+    case 16:
+    case 24:
+    case 32:
+        break;
+    default:
+        return false;
+    }
+
+    if (h.biCompression != BI_RGB &&
+        h.biCompression != BI_BITFIELDS &&
+        h.biCompression != BI_ALPHABITFIELDS) {
+        return false;
+    }
+
+    if ((h.biCompression == BI_BITFIELDS ||
+         h.biCompression == BI_ALPHABITFIELDS) &&
+        h.biBitCount != 16 &&
+        h.biBitCount != 32) {
+        return false;
+    }
+
+    bitsOffset = DIBBitsOffset(b, h);
+    if (bitsOffset == 0) {
+        return false;
+    }
+
+    size_t rowBits = 0;
+    if (!CheckedMulSize(
+            static_cast<size_t>(srcW),
+            static_cast<size_t>(h.biBitCount),
+            rowBits
+        )) {
+        return false;
+    }
+
+    size_t rowBitsRounded = 0;
+    if (!CheckedAddSize(rowBits, 31u, rowBitsRounded)) {
+        return false;
+    }
+
+    size_t stride = (rowBitsRounded / 32u) * 4u;
+    size_t pixelBytes = 0;
+    if (!CheckedMulSize(
+            stride,
+            static_cast<size_t>(srcH),
+            pixelBytes
+        )) {
+        return false;
+    }
+
+    if (pixelBytes > b.size() - bitsOffset) {
+        return false;
+    }
+
+    if (h.biSizeImage != 0 &&
+        static_cast<size_t>(h.biSizeImage) >
+            b.size() - bitsOffset) {
+        return false;
+    }
+
+    return true;
 }
 
 static PreviewImage PreviewFromDIB(const std::vector<std::uint8_t>& b) {
     PreviewImage out;
-    if (b.size() < sizeof(BITMAPINFOHEADER)) return out;
 
-    const BITMAPINFOHEADER* h = reinterpret_cast<const BITMAPINFOHEADER*>(b.data());
-    if (h->biSize < sizeof(BITMAPINFOHEADER) || h->biWidth == 0 || h->biHeight == 0) return out;
+    BITMAPINFOHEADER h{};
+    size_t bitsOffset = 0;
+    int srcW = 0;
+    int srcH = 0;
 
-    const int srcW = std::abs(h->biWidth);
-    const int srcH = std::abs(h->biHeight);
-    if (srcW <= 0 || srcH <= 0 || srcW > 32768 || srcH > 32768) return out;
-
-    const size_t bitsOffset = DIBBitsOffset(b);
-    if (bitsOffset == 0) return out;
+    if (!ValidateDIBPayload(
+            b,
+            h,
+            bitsOffset,
+            srcW,
+            srcH
+        )) {
+        return out;
+    }
 
     const int maxDim = 640;
-    double s = std::min(1.0, static_cast<double>(maxDim) / static_cast<double>(std::max(srcW, srcH)));
-    int dstW = std::max(1, static_cast<int>(std::lround(srcW * s)));
-    int dstH = std::max(1, static_cast<int>(std::lround(srcH * s)));
+    const double s = std::min(
+        1.0,
+        static_cast<double>(maxDim) /
+            static_cast<double>(std::max(srcW, srcH))
+    );
+    const int dstW = std::max(
+        1,
+        static_cast<int>(std::lround(srcW * s))
+    );
+    const int dstH = std::max(
+        1,
+        static_cast<int>(std::lround(srcH * s))
+    );
 
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = dstW;
-    bmi.bmiHeader.biHeight = -dstH; // top-down
+    bmi.bmiHeader.biHeight = -dstH;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -422,7 +603,14 @@ static PreviewImage PreviewFromDIB(const std::vector<std::uint8_t>& b) {
     HDC dc = CreateCompatibleDC(nullptr);
     if (!dc) return out;
 
-    HBITMAP bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    HBITMAP bmp = CreateDIBSection(
+        dc,
+        &bmi,
+        DIB_RGB_COLORS,
+        &pixels,
+        nullptr,
+        0
+    );
     if (!bmp || !pixels) {
         if (bmp) DeleteObject(bmp);
         DeleteDC(dc);
@@ -433,7 +621,7 @@ static PreviewImage PreviewFromDIB(const std::vector<std::uint8_t>& b) {
     SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, nullptr);
 
-    int copied = StretchDIBits(
+    const int copied = StretchDIBits(
         dc,
         0, 0, dstW, dstH,
         0, 0, srcW, srcH,
@@ -446,8 +634,17 @@ static PreviewImage PreviewFromDIB(const std::vector<std::uint8_t>& b) {
     if (copied != GDI_ERROR && copied != 0) {
         out.width = dstW;
         out.height = dstH;
-        out.bgra.resize(static_cast<size_t>(dstW) * dstH * 4);
-        std::memcpy(out.bgra.data(), pixels, out.bgra.size());
+        out.bgra.resize(
+            static_cast<size_t>(dstW) *
+            static_cast<size_t>(dstH) *
+            4u
+        );
+        std::memcpy(
+            out.bgra.data(),
+            pixels,
+            out.bgra.size()
+        );
+
         for (size_t i = 3; i < out.bgra.size(); i += 4) {
             out.bgra[i] = 255;
         }
@@ -524,6 +721,28 @@ static std::wstring RegisteredFormatName(UINT fmt) {
     return {};
 }
 
+static bool IsGlobalMemoryClipboardFormat(UINT fmt) {
+    switch (fmt) {
+    case CF_BITMAP:
+    case CF_PALETTE:
+    case CF_METAFILEPICT:
+    case CF_ENHMETAFILE:
+    case CF_DSPBITMAP:
+    case CF_DSPMETAFILEPICT:
+    case CF_DSPENHMETAFILE:
+        return false;
+    default:
+        break;
+    }
+
+    if (fmt >= CF_GDIOBJFIRST &&
+        fmt <= CF_GDIOBJLAST) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool CaptureClipboard(ClipSlot& slot, std::wstring& error) {
     slot = ClipSlot{};
     error.clear();
@@ -539,12 +758,39 @@ static bool CaptureClipboard(ClipSlot& slot, std::wstring& error) {
     constexpr size_t kTotalLimit = 512ull * 1024ull * 1024ull;
 
     UINT fmt = 0;
-    while ((fmt = EnumClipboardFormats(fmt)) != 0) {
+    for (;;) {
+        SetLastError(ERROR_SUCCESS);
+        const UINT next = EnumClipboardFormats(fmt);
+
+        if (next == 0) {
+            const DWORD enumError = GetLastError();
+            if (enumError != ERROR_SUCCESS) {
+                CloseClipboard();
+                slot = ClipSlot{};
+                error =
+                    L"枚举剪贴板格式失败（错误 " +
+                    std::to_wstring(enumError) +
+                    L"）";
+                return false;
+            }
+            break;
+        }
+
+        fmt = next;
+
+        if (!IsGlobalMemoryClipboardFormat(fmt)) {
+            continue;
+        }
+
         HANDLE h = GetClipboardData(fmt);
         if (!h) continue;
 
         SIZE_T sz = GlobalSize(static_cast<HGLOBAL>(h));
-        if (sz == 0 || sz > kPerFormatLimit || totalCopied + sz > kTotalLimit) continue;
+        if (sz == 0 ||
+            sz > kPerFormatLimit ||
+            totalCopied + sz > kTotalLimit) {
+            continue;
+        }
 
         void* p = GlobalLock(static_cast<HGLOBAL>(h));
         if (!p) continue;
@@ -691,7 +937,19 @@ static bool SaveClipboardBackup(ClipboardBackup& backup, std::wstring& error) {
     backup = ClipboardBackup{};
     error.clear();
 
-    if (CountClipboardFormats() == 0) {
+    SetLastError(ERROR_SUCCESS);
+    const int formatCount = CountClipboardFormats();
+
+    if (formatCount == 0) {
+        const DWORD countError = GetLastError();
+        if (countError != ERROR_SUCCESS) {
+            error =
+                L"无法查询系统剪贴板格式（错误 " +
+                std::to_wstring(countError) +
+                L"）";
+            return false;
+        }
+
         backup.valid = true;
         backup.wasEmpty = true;
         return true;
@@ -942,11 +1200,20 @@ static void UpdateMonitorAndScale() {
         UINT d = GetDpiForWindow(g_hwnd);
         if (d) dpi = d;
     }
-    g_scale = static_cast<float>(dpi) / 96.0f;
-    if (g_scale < 0.75f) g_scale = 0.75f;
-    if (g_scale > 3.0f) g_scale = 3.0f;
+    float newScale = static_cast<float>(dpi) / 96.0f;
+    if (newScale < 0.75f) newScale = 0.75f;
+    if (newScale > 3.0f) newScale = 3.0f;
 
-    RecreateTextFormats();
+    const bool scaleChanged =
+        std::fabs(newScale - g_scale) > 0.001f;
+
+    g_scale = newScale;
+
+    if (scaleChanged ||
+        !g_textFormat ||
+        !g_smallFormat) {
+        RecreateTextFormats();
+    }
 }
 
 static float SlotCardHeight(const ClipSlot& slot, float cardWidth) {
@@ -1777,7 +2044,7 @@ static void DeleteLatest() {
     }
 }
 
-static void SendCtrlKey(WORD vk) {
+static bool SendCtrlKey(WORD vk) {
     INPUT in[4]{};
 
     in[0].type = INPUT_KEYBOARD;
@@ -1794,15 +2061,29 @@ static void SendCtrlKey(WORD vk) {
     in[3].ki.wVk = VK_CONTROL;
     in[3].ki.dwFlags = KEYEVENTF_KEYUP;
 
-    SendInput(4, in, sizeof(INPUT));
+    const UINT sent = SendInput(4, in, sizeof(INPUT));
+    if (sent == 4) {
+        return true;
+    }
+
+    INPUT up[2]{};
+    up[0].type = INPUT_KEYBOARD;
+    up[0].ki.wVk = vk;
+    up[0].ki.dwFlags = KEYEVENTF_KEYUP;
+    up[1].type = INPUT_KEYBOARD;
+    up[1].ki.wVk = VK_CONTROL;
+    up[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, up, sizeof(INPUT));
+
+    return false;
 }
 
-static void SendCtrlV() {
-    SendCtrlKey('V');
+static bool SendCtrlV() {
+    return SendCtrlKey('V');
 }
 
-static void SendCtrlC() {
-    SendCtrlKey('C');
+static bool SendCtrlC() {
+    return SendCtrlKey('C');
 }
 
 static bool AnyKeyboardModifierDown() {
@@ -1812,20 +2093,112 @@ static bool AnyKeyboardModifierDown() {
         (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 }
 
+static bool SendPasteFromRegisteredHotkey(
+    WORD triggerVk,
+    bool restoreCtrlModifier
+) {
+    INPUT in[10]{};
+    UINT count = 0;
+
+    auto addKey = [&](WORD vk, bool keyUp) {
+        in[count].type = INPUT_KEYBOARD;
+        in[count].ki.wVk = vk;
+        in[count].ki.dwFlags =
+            keyUp ? KEYEVENTF_KEYUP : 0;
+        ++count;
+    };
+
+    // The registered hotkey fires while these keys are logically down.
+    // Temporarily release them so the injected Ctrl+V is not interpreted
+    // as Alt+Ctrl+V / Ctrl+Alt+1, then restore the held modifiers.
+    if (triggerVk != 0) {
+        addKey(triggerVk, true);
+    }
+
+    if (restoreCtrlModifier) {
+        addKey(VK_CONTROL, true);
+    }
+
+    addKey(VK_MENU, true);
+
+    // Actual paste chord.
+    addKey(VK_CONTROL, false);
+    addKey('V', false);
+    addKey('V', true);
+    addKey(VK_CONTROL, true);
+
+    // Recreate the modifier-down state expected while the user is still
+    // physically holding Alt (and Ctrl for Ctrl+Alt+1). The user's real
+    // key-up later clears these states normally.
+    if (restoreCtrlModifier) {
+        addKey(VK_CONTROL, false);
+    }
+
+    addKey(VK_MENU, false);
+
+    const UINT sent = SendInput(
+        count,
+        in,
+        sizeof(INPUT)
+    );
+
+    if (sent == count) {
+        return true;
+    }
+
+    // Best-effort modifier restoration after a partial SendInput.
+    INPUT restore[2]{};
+    UINT restoreCount = 0;
+
+    if (restoreCtrlModifier) {
+        restore[restoreCount].type = INPUT_KEYBOARD;
+        restore[restoreCount].ki.wVk = VK_CONTROL;
+        ++restoreCount;
+    }
+
+    restore[restoreCount].type = INPUT_KEYBOARD;
+    restore[restoreCount].ki.wVk = VK_MENU;
+    ++restoreCount;
+
+    SendInput(
+        restoreCount,
+        restore,
+        sizeof(INPUT)
+    );
+
+    return false;
+}
+
+static bool EnsureForegroundTarget(HWND target) {
+    if (!target || !IsWindow(target)) {
+        return false;
+    }
+
+    if (GetForegroundWindow() == target) {
+        return true;
+    }
+
+    SetForegroundWindow(target);
+    return GetForegroundWindow() == target;
+}
+
 static void FinishPasteState() {
     g_pastePhase = PastePhase::None;
-    g_pasteWaitTicks = 0;
     g_pasteRestoreTicks = 0;
-    g_pendingPasteSlot = ClipSlot{};
+    g_pasteRestoreDelayTicks = 25;
+    g_pasteTempSequence = 0;
     g_pasteBackup = ClipboardBackup{};
-    g_pendingPasteDeleteAfter = false;
-    g_pendingPasteDeleteIndex = -1;
     KillTimer(g_hwnd, TIMER_PASTE);
 }
 
-static void StartPasteSlot(int slotIndex, bool deleteAfterCopy) {
-    if (g_pastePhase != PastePhase::None ||
-        g_captureSelectionPhase != CaptureSelectionPhase::None) {
+static void StartPasteSlot(
+    int slotIndex,
+    bool deleteAfterCopy,
+    WORD triggerVk,
+    bool restoreCtrlModifier
+) {
+    if (g_captureSelectionPhase !=
+        CaptureSelectionPhase::None) {
         SetStatus(L"上一项剪贴板操作尚未结束");
         return;
     }
@@ -1836,27 +2209,125 @@ static void StartPasteSlot(int slotIndex, bool deleteAfterCopy) {
         return;
     }
 
+    // A running RestoreClipboard phase means the system clipboard currently
+    // contains RamClip's temporary paste data. Do NOT back it up again.
+    // Keep the original user clipboard snapshot and simply postpone restore.
+    bool continuingPasteBurst =
+        g_pastePhase == PastePhase::RestoreClipboard &&
+        g_pasteBackup.valid;
+
+    if (continuingPasteBurst &&
+        g_pasteTempSequence != 0 &&
+        GetClipboardSequenceNumber() !=
+            g_pasteTempSequence) {
+        // Someone changed the clipboard during the debounce window.
+        // Preserve that newer clipboard instead of restoring an older one.
+        FinishPasteState();
+        continuingPasteBurst = false;
+    }
+
     UpdatePasteTargetFromForeground();
 
-    std::wstring err;
-    ClipboardBackup backup;
+    if (!continuingPasteBurst) {
+        std::wstring backupErr;
+        ClipboardBackup backup;
 
-    if (!SaveClipboardBackup(backup, err)) {
+        if (!SaveClipboardBackup(backup, backupErr)) {
+            SetStatus(
+                L"为保护系统剪贴板，已取消粘贴：" +
+                backupErr
+            );
+            return;
+        }
+
+        g_pasteBackup = std::move(backup);
+    }
+
+    // Copy before a paste-and-delete operation can erase the slot.
+    ClipSlot pasteSlot = g_slots[slotIndex];
+
+    if (!EnsureForegroundTarget(g_pasteTarget)) {
+        if (!continuingPasteBurst) {
+            FinishPasteState();
+        }
+
         SetStatus(
-            L"为保护系统剪贴板，已取消粘贴：" + err
+            L"无法切换到原粘贴窗口，已取消本次粘贴"
         );
         return;
     }
 
-    g_pendingPasteSlot = g_slots[slotIndex];
-    g_pasteBackup = std::move(backup);
-    g_pendingPasteDeleteAfter = deleteAfterCopy;
-    g_pendingPasteDeleteIndex =
-        deleteAfterCopy ? slotIndex : -1;
+    std::wstring writeErr;
+    if (!PutSlotOnClipboard(pasteSlot, writeErr)) {
+        std::wstring restoreErr;
+        const bool restored =
+            RestoreClipboardBackup(
+                g_pasteBackup,
+                restoreErr
+            );
 
-    g_pastePhase = PastePhase::WaitModifiers;
-    g_pasteWaitTicks = 0;
+        FinishPasteState();
+
+        if (restored) {
+            SetStatus(
+                L"粘贴前写入临时剪贴板失败：" +
+                writeErr
+            );
+        } else {
+            SetStatus(
+                L"粘贴前写入临时剪贴板失败：" +
+                writeErr +
+                L"；恢复系统剪贴板也失败：" +
+                restoreErr
+            );
+        }
+        return;
+    }
+
+    g_pasteTempSequence =
+        GetClipboardSequenceNumber();
+
+    if (!SendPasteFromRegisteredHotkey(
+            triggerVk,
+            restoreCtrlModifier
+        )) {
+        std::wstring restoreErr;
+        const bool restored =
+            RestoreClipboardBackup(
+                g_pasteBackup,
+                restoreErr
+            );
+
+        FinishPasteState();
+
+        if (restored) {
+            SetStatus(
+                L"无法发送粘贴按键；目标程序可能以更高权限运行"
+            );
+        } else {
+            SetStatus(
+                L"无法发送粘贴按键，且恢复系统剪贴板失败：" +
+                restoreErr
+            );
+        }
+        return;
+    }
+
+    // Paste-and-delete now commits after the paste input was injected.
+    // This allows repeated Ctrl+Alt+1 presses to advance through slots.
+    if (deleteAfterCopy) {
+        DeleteSlotAt(slotIndex);
+    }
+
+    // Debounce clipboard restoration: every successful paste restarts the
+    // quiet-period countdown, so rapid repeated pastes share one backup.
+    g_pasteRestoreDelayTicks =
+        FindFormat(pasteSlot, CF_HDROP)
+            ? 40   // ~800 ms for file-drop consumers
+            : 25;  // ~500 ms for text/images
+
     g_pasteRestoreTicks = 0;
+    g_pastePhase = PastePhase::RestoreClipboard;
 
     KillTimer(g_hwnd, TIMER_PASTE);
     SetTimer(g_hwnd, TIMER_PASTE, 20, nullptr);
@@ -1868,7 +2339,12 @@ static void StartPasteSelected(bool deleteAfterCopy) {
         return;
     }
 
-    StartPasteSlot(g_selected, deleteAfterCopy);
+    StartPasteSlot(
+        g_selected,
+        deleteAfterCopy,
+        deleteAfterCopy ? '1' : '5',
+        deleteAfterCopy
+    );
 }
 
 static void StartPasteLatest() {
@@ -1877,7 +2353,12 @@ static void StartPasteLatest() {
         return;
     }
 
-    StartPasteSlot(0, false);
+    StartPasteSlot(
+        0,
+        false,
+        'V',
+        false
+    );
 }
 
 static void FinishCaptureSelectionState() {
@@ -2064,38 +2545,40 @@ static void UpdateUiAnimation() {
 static void RegisterPanelHotkeys() {
     if (g_panelHotkeysRegistered) return;
 
-    RegisterHotKey(
+    const bool okCycle = !!RegisterHotKey(
         g_hwnd,
         HK_CYCLE,
         MOD_ALT | MOD_NOREPEAT,
         '1'
     );
-    RegisterHotKey(
+    const bool okCopy = !!RegisterHotKey(
         g_hwnd,
         HK_COPY_CURRENT,
         MOD_ALT | MOD_NOREPEAT,
         '3'
     );
-    RegisterHotKey(
+    const bool okDelete = !!RegisterHotKey(
         g_hwnd,
         HK_DELETE,
         MOD_ALT | MOD_NOREPEAT,
         '4'
     );
-    RegisterHotKey(
-        g_hwnd,
-        HK_PASTE,
-        MOD_ALT | MOD_NOREPEAT,
-        '5'
-    );
-    RegisterHotKey(
-        g_hwnd,
-        HK_PASTE_DELETE,
-        MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-        '1'
-    );
 
-    g_panelHotkeysRegistered = true;
+    if (okCycle &&
+        okCopy &&
+        okDelete) {
+        g_panelHotkeysRegistered = true;
+        return;
+    }
+
+    UnregisterHotKey(g_hwnd, HK_CYCLE);
+    UnregisterHotKey(g_hwnd, HK_COPY_CURRENT);
+    UnregisterHotKey(g_hwnd, HK_DELETE);
+
+    g_panelHotkeysRegistered = false;
+    SetStatus(
+        L"部分面板快捷键注册失败，可能与其他软件冲突"
+    );
 }
 
 static void UnregisterPanelHotkeys() {
@@ -2104,8 +2587,6 @@ static void UnregisterPanelHotkeys() {
     UnregisterHotKey(g_hwnd, HK_CYCLE);
     UnregisterHotKey(g_hwnd, HK_COPY_CURRENT);
     UnregisterHotKey(g_hwnd, HK_DELETE);
-    UnregisterHotKey(g_hwnd, HK_PASTE);
-    UnregisterHotKey(g_hwnd, HK_PASTE_DELETE);
 
     g_panelHotkeysRegistered = false;
 }
@@ -2395,15 +2876,15 @@ static LRESULT CALLBACK WndProc(
             break;
 
         case HK_PASTE:
+            StartPasteSelected(false);
             if (g_panelVisible && g_panelOpenTarget) {
-                StartPasteSelected(false);
                 HidePanel();
             }
             break;
 
         case HK_PASTE_DELETE:
+            StartPasteSelected(true);
             if (g_panelVisible && g_panelOpenTarget) {
-                StartPasteSelected(true);
                 HidePanel();
             }
             break;
@@ -2428,99 +2909,56 @@ static LRESULT CALLBACK WndProc(
         }
 
         if (wParam == TIMER_PASTE) {
-            if (g_pastePhase == PastePhase::None) {
+            if (g_pastePhase !=
+                PastePhase::RestoreClipboard) {
                 KillTimer(hwnd, TIMER_PASTE);
                 return 0;
             }
 
-            if (g_pastePhase == PastePhase::WaitModifiers) {
-                ++g_pasteWaitTicks;
+            ++g_pasteRestoreTicks;
 
-                if (!AnyKeyboardModifierDown() ||
-                    g_pasteWaitTicks > 100) {
-                    if (g_pasteTarget &&
-                        IsWindow(g_pasteTarget)) {
-                        SetForegroundWindow(g_pasteTarget);
-                    }
-
-                    std::wstring err;
-                    if (!PutSlotOnClipboard(
-                            g_pendingPasteSlot,
-                            err
-                        )) {
-                        std::wstring restoreErr;
-                        const bool restored =
-                            RestoreClipboardBackup(
-                                g_pasteBackup,
-                                restoreErr
-                            );
-
-                        FinishPasteState();
-
-                        if (restored) {
-                            SetStatus(
-                                L"粘贴前写入临时剪贴板失败：" +
-                                err
-                            );
-                        } else {
-                            SetStatus(
-                                L"粘贴前写入临时剪贴板失败：" +
-                                err +
-                                L"；恢复系统剪贴板也失败：" +
-                                restoreErr
-                            );
-                        }
-                        return 0;
-                    }
-
-                    if (g_pendingPasteDeleteAfter) {
-                        DeleteSlotAt(
-                            g_pendingPasteDeleteIndex
-                        );
-                        g_pendingPasteDeleteAfter = false;
-                        g_pendingPasteDeleteIndex = -1;
-                    }
-
-                    SendCtrlV();
-
-                    g_pastePhase =
-                        PastePhase::RestoreClipboard;
-                    g_pasteRestoreTicks = 0;
-                }
-
+            if (g_pasteRestoreTicks <
+                g_pasteRestoreDelayTicks) {
                 return 0;
             }
 
-            if (g_pastePhase ==
-                PastePhase::RestoreClipboard) {
-                ++g_pasteRestoreTicks;
+            if (g_pasteTempSequence != 0 &&
+                GetClipboardSequenceNumber() !=
+                    g_pasteTempSequence) {
+                FinishPasteState();
 
-                if (g_pasteRestoreTicks < 8) {
-                    return 0;
-                }
-
-                std::wstring err;
-                if (RestoreClipboardBackup(
-                        g_pasteBackup,
-                        err
-                    )) {
-                    FinishPasteState();
-
-                    if (g_panelVisible) {
-                        SetStatus(L"已粘贴");
-                    }
-                    return 0;
-                }
-
-                if (g_pasteRestoreTicks >= 60) {
-                    FinishPasteState();
+                if (g_panelVisible) {
                     SetStatus(
-                        L"粘贴完成，但恢复系统剪贴板失败：" +
-                        err
+                        L"系统剪贴板已被其他程序更新，保留新内容"
                     );
                 }
                 return 0;
             }
+
+            std::wstring err;
+            if (RestoreClipboardBackup(
+                    g_pasteBackup,
+                    err
+                )) {
+                FinishPasteState();
+
+                if (g_panelVisible) {
+                    SetStatus(L"已恢复系统剪贴板");
+                }
+                return 0;
+            }
+
+            // Keep retrying for about 3 seconds total. A new paste hotkey
+            // during this period resets g_pasteRestoreTicks to zero.
+            if (g_pasteRestoreTicks >= 150) {
+                FinishPasteState();
+                SetStatus(
+                    L"粘贴完成，但恢复系统剪贴板失败：" +
+                    err
+                );
+            }
+
+            return 0;
         }
 
         if (wParam == TIMER_CAPTURE_SELECTION) {
@@ -2539,15 +2977,26 @@ static LRESULT CALLBACK WndProc(
 
                 if (!AnyKeyboardModifierDown() ||
                     g_captureSelectionTicks > 100) {
-                    if (g_captureTarget &&
-                        IsWindow(g_captureTarget)) {
-                        SetForegroundWindow(g_captureTarget);
+                    if (!EnsureForegroundTarget(
+                            g_captureTarget
+                        )) {
+                        FinishCaptureSelectionState();
+                        SetStatus(
+                            L"无法切换到原复制窗口，已取消 Alt+C"
+                        );
+                        return 0;
                     }
 
                     g_captureSequenceBefore =
                         GetClipboardSequenceNumber();
 
-                    SendCtrlC();
+                    if (!SendCtrlC()) {
+                        FinishCaptureSelectionState();
+                        SetStatus(
+                            L"无法发送 Ctrl+C；目标程序可能以更高权限运行"
+                        );
+                        return 0;
+                    }
 
                     g_captureSelectionPhase =
                         CaptureSelectionPhase::WaitClipboard;
@@ -2654,6 +3103,8 @@ static LRESULT CALLBACK WndProc(
         UnregisterHotKey(hwnd, HK_GLOBAL_CAPTURE);
         UnregisterHotKey(hwnd, HK_GLOBAL_PASTE);
         UnregisterHotKey(hwnd, HK_GLOBAL_DELETE);
+        UnregisterHotKey(hwnd, HK_PASTE);
+        UnregisterHotKey(hwnd, HK_PASTE_DELETE);
 
         KillTimer(hwnd, TIMER_STATUS);
         KillTimer(hwnd, TIMER_PASTE);
@@ -2690,7 +3141,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"Direct2D 初始化失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         return 1;
@@ -2705,7 +3156,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"DirectWrite 初始化失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         SafeRelease(g_d2dFactory);
@@ -2733,7 +3184,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"Direct2D 渲染目标初始化失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         SafeRelease(g_dwFactory);
@@ -2752,7 +3203,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"窗口类注册失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         SafeRelease(g_dcTarget);
@@ -2774,7 +3225,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"说明栏窗口类注册失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         SafeRelease(g_dcTarget);
@@ -2789,7 +3240,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
             WS_EX_LAYERED |
             WS_EX_NOACTIVATE,
         wc.lpszClassName,
-        L"RamClip",
+        kAppTitle,
         WS_POPUP,
         0,
         0,
@@ -2805,7 +3256,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"窗口创建失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         SafeRelease(g_dcTarget);
@@ -2837,7 +3288,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         MessageBoxW(
             nullptr,
             L"说明栏窗口创建失败。",
-            L"RamClip",
+            kAppTitle,
             MB_ICONERROR
         );
         DestroyWindow(g_hwnd);
@@ -2892,17 +3343,33 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         'Z'
     );
 
+    const bool okPasteSelected = !!RegisterHotKey(
+        g_hwnd,
+        HK_PASTE,
+        MOD_ALT | MOD_NOREPEAT,
+        '5'
+    );
+
+    const bool okPasteDeleteSelected = !!RegisterHotKey(
+        g_hwnd,
+        HK_PASTE_DELETE,
+        MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+        '1'
+    );
+
     if (!okToggle ||
         !okAdd ||
         !okExit ||
         !okGlobalCapture ||
         !okGlobalPaste ||
-        !okGlobalDelete) {
+        !okGlobalDelete ||
+        !okPasteSelected ||
+        !okPasteDeleteSelected) {
         MessageBoxW(
             nullptr,
             L"至少一个全局快捷键注册失败，可能与其他软件冲突。\n\n"
-            L"需要：Alt+`、Alt+2、Ctrl+Alt+`、Alt+C、Alt+V、Alt+Z。",
-            L"RamClip",
+            L"需要：Alt+`、Alt+2、Ctrl+Alt+`、Alt+C、Alt+V、Alt+Z、Alt+5、Ctrl+Alt+1。",
+            kAppTitle,
             MB_ICONWARNING
         );
     }
@@ -2910,7 +3377,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     MessageBoxW(
         nullptr,
         L"按下Alt+`打开/关闭界面",
-        L"RamClip",
+        kAppTitle,
         MB_OK | MB_ICONINFORMATION
     );
 
@@ -2931,4 +3398,3 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     return static_cast<int>(msg.wParam);
 }
-//DROPFILES不能用
