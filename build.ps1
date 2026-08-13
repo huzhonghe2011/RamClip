@@ -21,6 +21,7 @@ $CommonArgs = @(
     "-s",
     "-municode",
     "-mwindows",
+    "-Wl,--no-insert-timestamp",
     $Source
 )
 
