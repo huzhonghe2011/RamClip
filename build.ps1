@@ -193,7 +193,7 @@ function Build-RamClip {
     }
 
     Write-Host ""
-    Write-Host "Direct imports for $Target:"
+    Write-Host "Direct imports for ${Target}:"
     Get-ImportedDllNames `
         -BinaryPath $OutputExe `
         -Objdump $Objdump |
