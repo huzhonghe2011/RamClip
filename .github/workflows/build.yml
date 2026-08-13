@@ -16,9 +16,12 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  LLVM_MINGW_VERSION: "20260616"
+
 jobs:
   build:
-    name: Build Windows x64 + ARM64
+    name: Build Windows x64 + ARM64 portable packages
     runs-on: windows-2025
 
     steps:
@@ -30,9 +33,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $version = "20260616"
+          $version = "${{ env.LLVM_MINGW_VERSION }}"
           $archive = "llvm-mingw-$version-ucrt-x86_64.zip"
-
           $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive"
 
           $zip = Join-Path $env:RUNNER_TEMP "llvm-mingw.zip"
@@ -66,17 +68,23 @@ jobs:
         run: |
           x86_64-w64-mingw32-clang++ --version
           aarch64-w64-mingw32-clang++ --version
+          llvm-objdump --version
 
-      - name: Build RamClip
+      - name: Build portable packages
         shell: pwsh
         run: |
           .\build.ps1 -Arch all
 
+      - name: Show release contents
+        shell: pwsh
+        run: |
+          Get-ChildItem .\dist -Recurse
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: RamClip-Windows
+          name: RamClip-Windows-portable
           path: |
-            dist/*.exe
+            dist/*.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
