@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows x64 + ARM64
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install LLVM-MinGW
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = "20260616"
+          $archive = "llvm-mingw-$version-ucrt-x86_64.zip"
+
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive"
+
+          $zip = Join-Path $env:RUNNER_TEMP "llvm-mingw.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "llvm-mingw"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $zip
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath $destination
+
+          $root = Get-ChildItem `
+            -Path $destination `
+            -Directory |
+            Select-Object -First 1
+
+          if (-not $root) {
+              throw "LLVM-MinGW directory not found"
+          }
+
+          $bin = Join-Path $root.FullName "bin"
+
+          Add-Content `
+            -Path $env:GITHUB_PATH `
+            -Value $bin
+
+      - name: Show compiler versions
+        shell: pwsh
+        run: |
+          x86_64-w64-mingw32-clang++ --version
+          aarch64-w64-mingw32-clang++ --version
+
+      - name: Build RamClip
+        shell: pwsh
+        run: |
+          .\build.ps1 -Arch all
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: RamClip-Windows
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error

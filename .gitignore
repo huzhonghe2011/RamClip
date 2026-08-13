@@ -1,0 +1,32 @@
+# Build output
+/dist/
+/build/
+
+# Windows binaries
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# Object files
+*.o
+*.obj
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+*~
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
