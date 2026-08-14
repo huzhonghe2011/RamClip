@@ -21,7 +21,7 @@ env:
 
 jobs:
   build:
-    name: Build Windows x64 + ARM64 portable packages
+    name: Build Windows x64 + ARM64 EXEs and portable packages
     runs-on: windows-2025
 
     steps:
@@ -70,7 +70,7 @@ jobs:
           aarch64-w64-mingw32-clang++ --version
           llvm-objdump --version
 
-      - name: Build portable packages
+      - name: Build EXEs and portable packages
         shell: pwsh
         run: |
           .\build.ps1 -Arch all
@@ -83,8 +83,9 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: RamClip-Windows-portable
+          name: RamClip-Windows
           path: |
+            dist/*.exe
             dist/*.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error

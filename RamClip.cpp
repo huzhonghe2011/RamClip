@@ -40,7 +40,7 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 
-static constexpr wchar_t kAppTitle[] = L"RamClip v2.4";
+static constexpr wchar_t kAppTitle[] = L"RamClip";
 
 template<class T>
 static void SafeRelease(T*& p) {

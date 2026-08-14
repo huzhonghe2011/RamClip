@@ -180,7 +180,8 @@ function Build-RamClip {
     Write-Host "Target runtime: $RuntimeDir"
 
     # Deliberately NOT using -static.
-    # LLVM-MinGW C++ runtime DLLs will be copied beside the EXE below.
+    # This is the normal runtime-dependent build.
+    # The portable ZIP will bundle the required LLVM-MinGW runtime DLLs.
     $CompilerArgs = $CommonArgs + @(
         "-o",
         $OutputExe
@@ -191,6 +192,20 @@ function Build-RamClip {
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed: $Target"
     }
+
+    # Keep a copy of the runtime-dependent EXE for users who already have
+    # the required C++/LLVM-MinGW runtime environment available.
+    $NormalExe = Join-Path `
+        $Dist `
+        "RamClip-win-$Target.exe"
+
+    Copy-Item `
+        -Path $OutputExe `
+        -Destination $NormalExe `
+        -Force
+
+    Write-Host ""
+    Write-Host "Created runtime-dependent EXE: $NormalExe"
 
     Write-Host ""
     Write-Host "Direct imports for ${Target}:"
@@ -237,7 +252,7 @@ function Build-RamClip {
         -CompressionLevel Optimal
 
     Write-Host ""
-    Write-Host "Created: $ZipPath"
+    Write-Host "Created portable package: $ZipPath"
 }
 
 if ($Arch -eq "all" -or $Arch -eq "x64") {
@@ -257,19 +272,22 @@ if ($Arch -eq "all" -or $Arch -eq "arm64") {
 Write-Host ""
 Write-Host "Generating SHA256SUMS.txt..."
 
-$ZipFiles = @(
+$ReleaseFiles = @(
     Get-ChildItem `
         -Path $Dist `
-        -Filter "*.zip" `
         -File |
+        Where-Object {
+            $_.Extension -eq ".exe" -or
+            $_.Extension -eq ".zip"
+        } |
         Sort-Object Name
 )
 
-if ($ZipFiles.Count -eq 0) {
-    throw "No release ZIP files were generated."
+if ($ReleaseFiles.Count -eq 0) {
+    throw "No release EXE or ZIP files were generated."
 }
 
-$ZipFiles |
+$ReleaseFiles |
     ForEach-Object {
         $Hash = (
             Get-FileHash `
