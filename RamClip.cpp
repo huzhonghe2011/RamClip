@@ -219,7 +219,8 @@ enum TimerId {
     TIMER_STATUS = 200,
     TIMER_PASTE = 201,
     TIMER_CAPTURE_SELECTION = 202,
-    TIMER_UI_ANIMATION = 203
+    TIMER_UI_ANIMATION = 203,
+    TIMER_TOPMOST_WATCH = 204
 };
 
 static const wchar_t* kInstructions =
@@ -999,6 +1000,47 @@ static void UpdatePasteTargetFromForeground() {
         g_pasteTarget = fg;
     }
 }
+
+static bool WindowHasTopmostStyle(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+
+    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    return (exStyle & WS_EX_TOPMOST) != 0;
+}
+
+static void SetWindowTopmostNoActivate(HWND hwnd, bool forceRefresh) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+
+    // Normally only repair a window that was actually demoted from the
+    // TOPMOST band. When the UI is opened, forceRefresh=true also moves
+    // the overlay to the front of the current TOPMOST band without focus.
+    if (!forceRefresh && WindowHasTopmostStyle(hwnd)) {
+        return;
+    }
+
+    SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE |
+        SWP_NOSIZE |
+        SWP_NOACTIVATE |
+        SWP_NOSENDCHANGING
+    );
+}
+
+static void EnsurePanelsTopmost(bool forceRefresh = false) {
+    SetWindowTopmostNoActivate(g_hwnd, forceRefresh);
+    SetWindowTopmostNoActivate(g_instructionHwnd, forceRefresh);
+}
+
 
 static void DestroySurface() {
     if (g_memDC) {
@@ -2539,6 +2581,7 @@ static void UpdateUiAnimation() {
         }
 
         KillTimer(g_hwnd, TIMER_UI_ANIMATION);
+        KillTimer(g_hwnd, TIMER_TOPMOST_WATCH);
     }
 }
 
@@ -2619,6 +2662,15 @@ static void ShowPanel() {
         );
     }
 
+    // Reassert topmost every time the UI opens. This puts both overlays
+    // back at the front of the current TOPMOST band without activating them.
+    EnsurePanelsTopmost(true);
+
+    // While visible, periodically repair TOPMOST only if another program or
+    // a shell/display transition actually removed it.
+    KillTimer(g_hwnd, TIMER_TOPMOST_WATCH);
+    SetTimer(g_hwnd, TIMER_TOPMOST_WATCH, 1000, nullptr);
+
     RegisterPanelHotkeys();
     InstallPanelMouseHook();
 
@@ -2641,6 +2693,7 @@ static void HidePanel() {
     UnregisterPanelHotkeys();
     RemovePanelMouseHook();
 
+    KillTimer(g_hwnd, TIMER_TOPMOST_WATCH);
     KillTimer(g_hwnd, TIMER_UI_ANIMATION);
     SetTimer(g_hwnd, TIMER_UI_ANIMATION, 16, nullptr);
 }
@@ -2816,6 +2869,7 @@ static LRESULT CALLBACK WndProc(
     case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
         if (g_panelVisible) {
+            EnsurePanelsTopmost(true);
             RenderPanel();
             RenderInstructions();
         }
@@ -2905,6 +2959,17 @@ static LRESULT CALLBACK WndProc(
 
         if (wParam == TIMER_UI_ANIMATION) {
             UpdateUiAnimation();
+            return 0;
+        }
+
+        if (wParam == TIMER_TOPMOST_WATCH) {
+            if (!g_panelVisible || !g_panelOpenTarget) {
+                KillTimer(hwnd, TIMER_TOPMOST_WATCH);
+                return 0;
+            }
+
+            // Normal watchdog pass: only repair actual demotion.
+            EnsurePanelsTopmost(false);
             return 0;
         }
 
@@ -3110,6 +3175,7 @@ static LRESULT CALLBACK WndProc(
         KillTimer(hwnd, TIMER_PASTE);
         KillTimer(hwnd, TIMER_CAPTURE_SELECTION);
         KillTimer(hwnd, TIMER_UI_ANIMATION);
+        KillTimer(hwnd, TIMER_TOPMOST_WATCH);
 
         if (g_instructionHwnd) {
             DestroyWindow(g_instructionHwnd);
